@@ -29,6 +29,10 @@ def apply_memit_to_model(
     copy=False,
     return_orig_weights=False,
     cache_template: Optional[str] = None,
+    memit_merge=False,
+    single_key=False,
+    single_value=False,
+    memit_merge_group_sizes=None,
 ) -> Tuple[AutoModelForCausalLM, Dict[str, Any]]:
     """
     Returns a model with the desired changes.
@@ -41,7 +45,17 @@ def apply_memit_to_model(
     if copy:
         model = deepcopy(model)
 
-    deltas = execute_memit(model, tok, requests, hparams, cache_template=cache_template)
+    deltas = execute_memit(
+        model,
+        tok,
+        requests,
+        hparams,
+        cache_template=cache_template,
+        memit_merge=memit_merge,
+        single_key=single_key,
+        single_value=single_value,
+        memit_merge_group_sizes=memit_merge_group_sizes,
+    )
 
     with torch.no_grad():
         for w_name, (key_mat, val_mat) in deltas.items():
@@ -66,6 +80,10 @@ def execute_memit(
     requests: List[Dict],
     hparams: MEMITHyperParams,
     cache_template: Optional[str] = None,
+    memit_merge=False,
+    single_key=False,
+    single_value=False,
+    memit_merge_group_sizes=None,
 ) -> Dict[str, Tuple[torch.Tensor]]:
     """
     Executes the MEMIT update algorithm for the specified update at the specified layer
@@ -75,11 +93,41 @@ def execute_memit(
     deltas = {}
 
     # Update target and print info
+    suffix = []
     requests = deepcopy(requests)
+    if memit_merge_group_sizes is not None:
+        if not memit_merge:
+            raise ValueError("memit_merge_group_sizes requires memit_merge=True.")
+        if single_key or single_value:
+            raise ValueError("Grouped batch MEMIT-XF does not support single_key/single_value ablations.")
+        if sum(memit_merge_group_sizes) != len(requests):
+            raise ValueError(
+                f"Group sizes sum to {sum(memit_merge_group_sizes)}, but received {len(requests)} requests."
+            )
     for i, request in enumerate(requests):
         if request["target_new"]["str"][0] != " ":
             # Space required for correct tokenization
             requests[i]["target_new"]["str"] = " " + request["target_new"]["str"]
+            if type(request["case_id"]) == int:
+                suffix.append("completion")
+            elif "triplet" in request["case_id"]:
+                suffix.append("triplet")
+            elif "ODQA" in request["case_id"]:
+                suffix.append("ODQA")
+            elif "MC" in request["case_id"]:
+                suffix.append("MC")
+            elif "TF" in request["case_id"]:
+                suffix.append("TF")
+            elif "YN" in request["case_id"]:
+                suffix.append("YN")
+            elif "paraphrase" in request["case_id"]:
+                suffix.append("paraphrase")
+            elif "portability" in request["case_id"]:
+                suffix.append("portability")
+            else:
+                raise Exception
+    suffix = "_".join(sorted(set(suffix)))
+
     for request in requests[:10]:
         print(
             f"MEMIT request sample: "
@@ -101,12 +149,58 @@ def execute_memit(
     z_layer = hparams.layers[-1]
     z_list = []
 
-    for request in requests:
+    if not memit_merge:
+        for request in requests:
+            # Retrieve k/v pair if already stored in cache
+            cache_fname = (
+                Path(
+                    str(cache_template).format(
+                        z_layer, hparams.clamp_norm_factor, request["case_id"]
+                    )
+                )
+                if cache_template is not None
+                else None
+            )
+            data_loaded = False
+            if (
+                cache_fname is not None  # Require cache template
+                and cache_fname.exists()  # Cache file must exist
+            ):
+                try:
+                    data = np.load(cache_fname)
+                    z_list.append(torch.from_numpy(data["v_star"]).to("cuda"))
+                    data_loaded = True
+                except Exception as e:
+                    print(f"Error reading cache file due to {e}. Recomputing...")
+
+            # Compute k/v pair if not loaded from cache
+            if not data_loaded:
+                cur_z = compute_z(
+                    model,
+                    tok,
+                    request,
+                    hparams,
+                    z_layer,
+                    context_templates,
+                )
+
+                z_list.append(cur_z)
+
+                if cache_fname is not None:
+                    cache_fname.parent.mkdir(exist_ok=True, parents=True)
+                    np.savez(
+                        cache_fname,
+                        **{
+                            "v_star": cur_z.detach().cpu().numpy(),
+                        },
+                    )
+                    print(f"Cached k/v pair at {cache_fname}")
+    elif memit_merge_group_sizes is None:
         # Retrieve k/v pair if already stored in cache
         cache_fname = (
             Path(
                 str(cache_template).format(
-                    z_layer, hparams.clamp_norm_factor, request["case_id"]
+                    z_layer, hparams.clamp_norm_factor, f'{str(requests[0]["case_id"]).split("_")[0]}_memit_merge_{suffix}_{single_key}_{single_value}'
                 )
             )
             if cache_template is not None
@@ -129,7 +223,7 @@ def execute_memit(
             cur_z = compute_z(
                 model,
                 tok,
-                request,
+                requests[:1] if single_value else requests,
                 hparams,
                 z_layer,
                 context_templates,
@@ -146,31 +240,129 @@ def execute_memit(
                     },
                 )
                 print(f"Cached k/v pair at {cache_fname}")
+    else:
+        group_start = 0
+        for group_idx, group_size in enumerate(memit_merge_group_sizes):
+            group_requests = requests[group_start : group_start + group_size]
+            group_start += group_size
+            group_suffix = "_".join(
+                sorted(
+                    {
+                        "completion" if type(request["case_id"]) == int else str(request["case_id"]).split("_")[-1]
+                        for request in group_requests
+                    }
+                )
+            )
+            cache_case_id = (
+                f'{str(group_requests[0]["case_id"]).split("_")[0]}'
+                f"_memit_merge_batch_{group_suffix}_{single_key}_{single_value}"
+            )
+            cache_fname = (
+                Path(
+                    str(cache_template).format(
+                        z_layer,
+                        hparams.clamp_norm_factor,
+                        cache_case_id,
+                    )
+                )
+                if cache_template is not None
+                else None
+            )
+            data_loaded = False
+            if cache_fname is not None and cache_fname.exists():
+                try:
+                    data = np.load(cache_fname)
+                    z_list.append(torch.from_numpy(data["v_star"]).to("cuda"))
+                    data_loaded = True
+                except Exception as e:
+                    print(f"Error reading cache file due to {e}. Recomputing...")
+
+            if not data_loaded:
+                cur_z = compute_z(
+                    model,
+                    tok,
+                    group_requests,
+                    hparams,
+                    z_layer,
+                    context_templates,
+                )
+                z_list.append(cur_z)
+
+                if cache_fname is not None:
+                    cache_fname.parent.mkdir(exist_ok=True, parents=True)
+                    np.savez(cache_fname, **{"v_star": cur_z.detach().cpu().numpy()})
+                    print(f"Cached grouped batch v* at {cache_fname}")
+
     zs = torch.stack(z_list, dim=1)
+    representative_requests = None
+    if memit_merge_group_sizes is not None:
+        representative_requests = []
+        group_start = 0
+        for group_size in memit_merge_group_sizes:
+            representative_requests.append(requests[group_start])
+            group_start += group_size
 
     # Insert
     for i, layer in enumerate(hparams.layers):
         print(f"\n\nLAYER {layer}\n")
 
         # Get current model activations
-        layer_ks = compute_ks(model, tok, requests, hparams, layer, context_templates).T
+        if not single_key:
+            layer_ks = compute_ks(model, tok, requests, hparams, layer, context_templates).T
+        else:
+            layer_ks = compute_ks(model, tok, requests[:1], hparams, layer, context_templates).T
         print(f"Writing {layer_ks.size(1)} key/value pair(s) into layer {layer}")
 
-        # Compute residual error
-        cur_zs = get_module_input_output_at_words(
-            model,
-            tok,
-            z_layer,
-            context_templates=[request["prompt"] for request in requests],
-            words=[request["subject"] for request in requests],
-            module_template=hparams.layer_module_tmp,
-            fact_token_strategy=hparams.fact_token,
-        )[1].T
+        if representative_requests is not None:
+            cur_zs = get_module_input_output_at_words(
+                model,
+                tok,
+                z_layer,
+                context_templates=[request["prompt"] for request in representative_requests],
+                words=[request["subject"] for request in representative_requests],
+                module_template=hparams.layer_module_tmp,
+                fact_token_strategy=hparams.fact_token,
+            )[1].T
+        elif not single_key:
+        # if not single_value:
+            # Compute residual error
+            cur_zs = get_module_input_output_at_words(
+                model,
+                tok,
+                z_layer,
+                context_templates=[request["prompt"] for request in requests],
+                words=[request["subject"] for request in requests],
+                module_template=hparams.layer_module_tmp,
+                fact_token_strategy=hparams.fact_token,
+            )[1].T
+        else:
+            # Compute residual error
+            cur_zs = get_module_input_output_at_words(
+                model,
+                tok,
+                z_layer,
+                context_templates=[request["prompt"] for request in requests[:1]],
+                words=[request["subject"] for request in requests[:1]],
+                module_template=hparams.layer_module_tmp,
+                fact_token_strategy=hparams.fact_token,
+            )[1].T
         targets = zs - cur_zs
         print("z error", torch.linalg.norm(targets, dim=0).mean())
 
-        repeat_factor = (layer_ks.size(1) // targets.size(1))
-        targets = targets.repeat_interleave(repeat_factor, dim=1)
+        if memit_merge_group_sizes is not None:
+            targets = torch.cat(
+                [
+                    targets[:, group_idx : group_idx + 1].repeat(1, group_size)
+                    for group_idx, group_size in enumerate(memit_merge_group_sizes)
+                ],
+                dim=1,
+            )
+        elif not single_key:
+            repeat_factor = (layer_ks.size(1) // targets.size(1))
+            targets = targets.repeat_interleave(repeat_factor, dim=1)
+        else:
+            repeat_factor = (targets.size(1) // layer_ks.size(1))
+            layer_ks = layer_ks.repeat_interleave(repeat_factor, dim=1)
 
         # Load covariance matrix
         force_recompute = False
@@ -193,10 +385,16 @@ def execute_memit(
             targets.double(),
         )
 
-        adj_k = torch.linalg.solve(
-            hparams.mom2_update_weight * cov.double() + layer_ks @ layer_ks.T,
-            layer_ks,
-        )
+        try:
+            adj_k = torch.linalg.solve(
+                hparams.mom2_update_weight * cov.double() + layer_ks @ layer_ks.T,
+                layer_ks,
+            )
+        except:
+            adj_k = torch.linalg.lstsq(
+                hparams.mom2_update_weight * cov.double() + layer_ks @ layer_ks.T,
+                layer_ks,
+            ).solution
         resid = targets / (len(hparams.layers) - i)  # Distribute residual across layers
         upd_matrix = resid @ adj_k.T
 
@@ -215,10 +413,12 @@ def execute_memit(
                 resid.detach().cpu(),
             )
 
-        # Clear GPU memory
-        cov.cpu()
-        for x in [layer_ks, cur_zs, targets]:
-            x.cpu()
+        # Clear large per-layer tensors before moving to the next rewrite layer.
+        for x in [layer_ks, cur_zs, targets, cov, adj_k, resid, upd_matrix]:
+            try:
+                x.cpu()
+            except Exception:
+                pass
             del x
         torch.cuda.empty_cache()
 

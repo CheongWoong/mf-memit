@@ -1,0 +1,4 @@
+- To isolate the contributions of each component in the proposed method (multi-format editing).
+- Components: Multi-key, Multi-value, Joint objective.
+- Conclusion 1: Output inconsistency arises from value divergence, rather than key variation.
+- Conclusion 2: Joint objective is necessary to handle conflicting signals.

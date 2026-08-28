@@ -1,0 +1,1 @@
+OMP_NUM_THREADS=1 python mf-memit/causal_trace.py --model_name meta-llama/Llama-3.2-3B-Instruct --fact_file data/causal_tracing_YN.json

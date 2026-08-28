@@ -47,6 +47,7 @@ def main():
             "gpt2-large",
             "gpt2-medium",
             "gpt2",
+            "meta-llama/Llama-3.2-3B-Instruct",
         ],
     )
     aa("--fact_file", default=None)
@@ -65,6 +66,7 @@ def main():
 
     # Half precision to let the 20b model fit.
     torch_dtype = torch.float16 if "20b" in args.model_name else None
+    torch_dtype = torch.float16 if "Llama-3" in args.model_name else torch_dtype
 
     mt = ModelAndTokenizer(args.model_name, torch_dtype=torch_dtype)
 
@@ -473,7 +475,7 @@ class ModelAndTokenizer:
         self.layer_names = [
             n
             for n, m in model.named_modules()
-            if (re.match(r"^(transformer|gpt_neox)\.(h|layers)\.\d+$", n))
+            if (re.match(r"^(transformer|gpt_neox|model)\.(h|layers|layers)\.\d+$", n))
         ]
         self.num_layers = len(self.layer_names)
 
@@ -496,6 +498,12 @@ def layername(model, num, kind=None):
         if kind == "attn":
             kind = "attention"
         return f'gpt_neox.layers.{num}{"" if kind is None else "." + kind}'
+    if hasattr(model, "model"):
+        if kind == "embed":
+            return "model.embed_tokens"
+        if kind == "attn":
+            kind = "self_attn"
+        return f'model.layers.{num}{"" if kind is None else "." + kind}'
     assert False, "unknown transformer structure"
 
 
@@ -670,7 +678,7 @@ def get_embedding_cov(mt):
         try:
             maxlen = model.config.n_positions
         except:
-            maxlen = 100  # Hack due to missing setting in GPT2-NeoX.
+            maxlen = 2048  # Hack due to missing setting in GPT2-NeoX.
         return TokenizedDataset(raw_ds["train"], tokenizer, maxlen=maxlen)
 
     ds = get_ds()

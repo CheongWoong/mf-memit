@@ -83,11 +83,16 @@ def get_words_idxs_in_templates(
 
     # Compute indices of last tokens
     if subtoken == "last" or subtoken == "first_after_last":
+        if hasattr(tok, "add_bos_token"):
+            has_bos_token = 1 if tok.add_bos_token else 0
+        else:
+            has_bos_token = 0 if tok.bos_token_id is None else 1
         return [
             [
                 prefixes_len[i]
                 + words_len[i]
                 - (1 if subtoken == "last" or suffixes_len[i] == 0 else 0)
+                - has_bos_token
             ]
             # If suffix is empty, there is no "first token after the last".
             # So, just return the last token of the word.

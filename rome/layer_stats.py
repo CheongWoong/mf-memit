@@ -35,7 +35,7 @@ def main():
     def aa(*args, **kwargs):
         parser.add_argument(*args, **kwargs)
 
-    aa("--model_name", default="gpt2-xl", choices=["gpt2-xl", "EleutherAI/gpt-j-6B"])
+    aa("--model_name", default="meta-llama/Llama-3.2-3B-Instruct")
     aa("--dataset", default="wikipedia", choices=["wikitext", "wikipedia"])
     aa("--layers", default=[17], type=lambda x: list(map(int, x.split(","))))
     aa("--to_collect", default=["mom2"], type=lambda x: x.split(","))
@@ -47,7 +47,7 @@ def main():
     args = parser.parse_args()
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)
-    model = AutoModelForCausalLM.from_pretrained(args.model_name).eval().cuda()
+    model = AutoModelForCausalLM.from_pretrained(args.model_name, torch_dtype=torch.float16 if args.precision == "float16" else None).eval().cuda()
     set_requires_grad(False, model)
 
     for layer_num in args.layers:
@@ -57,8 +57,8 @@ def main():
             "Note, the statistics are collected over the inputs to the second MLP layer, "
             "or equivalently the outputs of the first MLP layer."
         )
-        proj_layer_name = "c_proj" if "gpt2" in args.model_name else "fc_out"
-        layer_name = f"transformer.h.{layer_num}.mlp.{proj_layer_name}"
+        proj_layer_name = "down_proj"
+        layer_name = f"model.layers.{layer_num}.mlp.{proj_layer_name}"
 
         layer_stats(
             model,
@@ -98,14 +98,20 @@ def layer_stats(
             ds_name,
             dict(wikitext="wikitext-103-raw-v1", wikipedia="20200501.en")[ds_name],
         )
-        maxlen = model.config.n_positions
+        try:
+            maxlen = model.config.n_positions
+        except:
+            maxlen = 2048
         if batch_tokens is not None and batch_tokens < maxlen:
             maxlen = batch_tokens
         return TokenizedDataset(raw_ds["train"], tokenizer, maxlen=maxlen)
 
     # Continue with computation of statistics
     batch_size = 100  # Examine this many dataset texts at once
-    npos = model.config.n_positions
+    try:
+        npos = model.config.n_positions
+    except:
+        npos = 2048
     if batch_tokens is None:
         batch_tokens = npos * 3  # Sort and divide into batches with this many tokens
     if precision is None:

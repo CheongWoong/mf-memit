@@ -1,0 +1,1 @@
+- To reveal cross-format failures that are not captured by standard generalization evaluation (paraphrase-based) settings.

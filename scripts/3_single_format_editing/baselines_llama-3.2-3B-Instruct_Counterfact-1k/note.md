@@ -1,0 +1,1 @@
+- Generality across editing methods.

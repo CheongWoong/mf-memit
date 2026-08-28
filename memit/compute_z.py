@@ -1,4 +1,5 @@
 from typing import Dict, List, Tuple
+import time
 
 import numpy as np
 import torch
@@ -13,7 +14,7 @@ from .memit_hparams import MEMITHyperParams
 def compute_z(
     model: AutoModelForCausalLM,
     tok: AutoTokenizer,
-    request: Dict,
+    request,
     hparams: MEMITHyperParams,
     layer: int,
     context_templates: List[str],
@@ -35,32 +36,45 @@ def compute_z(
 
     print("Computing right vector (v)")
 
-    # Tokenize target into list of int token IDs
-    target_ids = tok(request["target_new"]["str"], return_tensors="pt").to("cuda")[
-        "input_ids"
-    ][0]
+    ###########################################################
+    # implement MEMIT-Merge: https://github.com/NUSTM/MEMIT-Merge/blob/main/easyeditor/models/memit_merge/compute_z.py
+    requests = request if type(request) == list else [request]
+    
+    target_idss = []
+    for request in requests:
+        target_ids = tok(request["target_new"]["str"], add_special_tokens=False, return_tensors="pt").to("cuda")[
+            "input_ids"
+        ][0]
+        target_idss.append(target_ids)
 
     # Compile list of rewriting and KL x/y pairs
-    rewriting_prompts, kl_prompts = [
-        context.format(request["prompt"]) + tok.decode(target_ids[:-1])
-        for context_types in context_templates
-        for context in context_types
-    ], ["{} is a"]
+    rewriting_prompts, request_indicator_ls = [], []
+    for idx, (request, target_ids) in enumerate(zip(requests, target_idss)):
+        prefixed_prompts = [
+            context.format(request["prompt"]) + tok.decode(target_ids[:-1])
+            for context_types in context_templates
+            for context in context_types
+        ]
+        rewriting_prompts += prefixed_prompts
+        request_indicator_ls += [idx]*len(prefixed_prompts)
+    kl_prompts = ["{} is a"] # KL prompts should be sufficient with one
     all_prompts = rewriting_prompts + kl_prompts
 
     input_tok = tok(
-        [prompt.format(request["subject"]) for prompt in all_prompts],
+        [prompt.format(request["subject"]) for prompt in all_prompts], # Assume all subjects are the same
         return_tensors="pt",
         padding=True,
     ).to("cuda")
-
+    
     # Compute rewriting targets
     rewriting_targets = torch.tensor(-100, device="cuda").repeat(
         len(rewriting_prompts), *input_tok["input_ids"].shape[1:]
     )
     for i in range(len(rewriting_prompts)):
+        target_ids = target_idss[request_indicator_ls[i]]
         ex_len = input_tok["attention_mask"][i].sum()
         rewriting_targets[i, ex_len - len(target_ids) : ex_len] = target_ids
+    ###########################################################
 
     # Compute indices of the tokens where the fact is looked up
     lookup_idxs = [
@@ -78,7 +92,10 @@ def compute_z(
     # Set up an optimization over a latent vector that, when output at the
     # rewrite layer, i.e. hypothesized fact lookup location, will induce the
     # target token to be predicted at the final layer.
-    delta = torch.zeros((model.config.n_embd,), requires_grad=True, device="cuda")
+    try:
+        delta = torch.zeros((model.config.n_embd,), requires_grad=True, device="cuda")
+    except:
+        delta = torch.zeros((model.config.hidden_size,), requires_grad=True, device="cuda")
     target_init, kl_distr_init = None, None
 
     # Inserts new "delta" variable at the appropriate part of the computation
@@ -102,6 +119,7 @@ def compute_z(
     opt = torch.optim.Adam([delta], lr=hparams.v_lr)
     nethook.set_requires_grad(False, model)
 
+    start_time = time.time()
     # Execute optimization
     for it in range(hparams.v_num_grad_steps):
         opt.zero_grad()
@@ -174,12 +192,17 @@ def compute_z(
         if delta.norm() > max_norm:
             with torch.no_grad():
                 delta[...] = delta * max_norm / delta.norm()
+    execution_time = time.time() - start_time
+    num_steps = it
 
     target = target_init + delta
     print(
         f"Init norm {target_init.norm()} | Delta norm {delta.norm()} | Target norm {target.norm()}"
     )
 
+    debug = False
+    if debug:
+        print("DEBUG:", execution_time, num_steps)
     return target
 
 

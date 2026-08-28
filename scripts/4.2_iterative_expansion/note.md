@@ -1,0 +1,2 @@
+- To reduce editing time introduced by multi-format editing.
+- By finding a minimal sufficient set of supervised formats to cover the given set of formats.

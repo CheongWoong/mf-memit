@@ -1,6 +1,7 @@
 # Pipeline dumps, data directory
 results
 data
+!data/.gitignore
 !notebooks/data
 *_tmp_*_.json
 *_kmeng01g1gn*
@@ -163,3 +164,29 @@ dmypy.json
 
 # Cython debug symbols
 cython_debug/
+
+# Custom
+*.pt
+logs/*
+local_archive/
+mf-memit/PAPER/rebuttal/artifacts/*_by_case.csv
+
+# Private and post-submission research artifacts
+/baselines/rebuttal_alphaedit_sequential/
+/baselines/rebuttal_unke/
+/data/generate_multiformat_pep.py
+/data/multiformat_pep.json
+/data/pep_3k_test.tsv
+/data/pep_3k_valid.tsv
+/experiments/csml/
+/hparams/deprecated/
+/hparams/MEMIT/deprecated/
+/mf-memit/PAPER/
+/mf-memit/deprecated/
+/notebooks/vis/v_star_dynamics/
+/results/post_submission_EMNLP26/
+/scripts/3.1_save_v_star_trajectory/deprecated/
+/scripts/3_single_format_editing/baselines_llama-3.2-3B-Instruct_Counterfact-1k/deprecated/
+/scripts/agent-assisted-expansion_adversarial_format_generation/
+/scripts/deprecated-BACKUP-20260408/
+/scripts/post_submission_EMNLP26/
